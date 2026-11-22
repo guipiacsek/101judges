@@ -2,16 +2,13 @@
 
 import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
-import { JUDGES, type Judge } from '@/lib/judges';
+import { byVote, color, COLORS, JUDGES, type Judge } from '@/lib/judges';
 import { T, TRAITS } from '@/lib/i18n';
 import { norm, seats } from '@/lib/vote';
 import type { Locale, Result, Trend } from '@/lib/types';
 import Nav from './Nav';
 
-const COLORS = ['#0A84FF', '#FF9F0A', '#30D158', '#FF375F', '#BF5AF2', '#5AC8FA'];
-const NONE = '#D3CEC6';
 const SUMMARIZE_AT = 250;
-const color = (v: string) => (v === '-' ? NONE : COLORS[+v]);
 const pct = (n: number, of: number) => (of ? Math.round((n / of) * 100) : 0);
 
 export default function Home({ locale, trending, initial }: { locale: Locale; trending: Trend[]; initial?: Result }) {
@@ -262,13 +259,7 @@ function Verdict({ result, t, onPick }: { result: Result; t: Dict; onPick: (j: J
 
 function Hemicycle({ votes, options, t, onPick, pulse }: { votes: string; options: string[]; t: Dict; onPick?: (j: Judge) => void; pulse?: boolean }) {
   const pts = useMemo(() => seats(), []);
-  // Group seats by vote (no-answer last), then by age, so each answer forms a wedge.
-  const order = useMemo(
-    () =>
-      JUDGES.map((j, k) => ({ j, v: votes[k] }))
-        .sort((a, b) => (a.v === '-' ? 99 : +a.v) - (b.v === '-' ? 99 : +b.v) || a.j.age - b.j.age),
-    [votes],
-  );
+  const order = useMemo(() => byVote(votes), [votes]);
   return (
     <svg className={'hemi' + (pulse ? ' pulse' : '')} viewBox="-1.07 -1.07 2.14 1.13" role="group" aria-label="101 judges">
       {pts.map((p, i) => {
