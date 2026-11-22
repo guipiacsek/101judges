@@ -5,10 +5,9 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboa
 import { byVote, color, COLORS, JUDGES, type Judge } from '@/lib/judges';
 import { T, TRAITS } from '@/lib/i18n';
 import { norm, seats } from '@/lib/vote';
-import type { Locale, Result, Trend } from '@/lib/types';
+import { SUMMARIZE_AT, type Locale, type Result, type Trend } from '@/lib/types';
 import Nav from './Nav';
 
-const SUMMARIZE_AT = 250;
 const pct = (n: number, of: number) => (of ? Math.round((n / of) * 100) : 0);
 
 export default function Home({ locale, trending, initial }: { locale: Locale; trending: Trend[]; initial?: Result }) {
@@ -43,7 +42,7 @@ export default function Home({ locale, trending, initial }: { locale: Locale; tr
       const d = await res.json();
       if (d.status === 'ok') {
         setResult(d.result);
-        history.pushState(null, '', `/r/${d.result.id}`);
+        history.replaceState(null, '', `/r/${d.result.id}`); // replace, so Back leaves the page instead of only changing the URL
       } else {
         setError(t.errors[d.status === 'limit' ? (d.window === 'hour' ? 'limitHour' : 'limitDay') : d.status] ?? t.errors.error);
       }
@@ -108,7 +107,7 @@ export default function Home({ locale, trending, initial }: { locale: Locale; tr
                 {t.addOption}
               </button>
             )}
-            <button className="pill dark" onClick={ask} disabled={busy || !canAsk}>
+            <button className="pill dark" onClick={ask} disabled={busy}>
               {busy ? t.asking : t.ask}
             </button>
             {error && (

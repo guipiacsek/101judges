@@ -2,17 +2,19 @@ import { createHash } from 'node:crypto';
 import { cache } from 'react';
 import { JUDGES, persona, type Judge } from './judges';
 import { matchOption, norm, shuffle } from './vote';
-import type { Locale, Result, Trend } from './types';
+import { SUMMARIZE_AT, type Locale, type Result, type Trend } from './types';
 import { T } from './i18n';
 
 const FREE_MODEL = 'gpt-5-mini'; // shared free pool: 2.5M tokens/day
 const PAID_MODEL = 'gpt-5-nano'; // cheapest, used once the free pool is spent
-const FREE_TOKENS_PER_DAY = 2_400_000; // keep a 100k margin under OpenAI's 2.5M
+// OpenAI's 2.5M/day is shared with any other use of the same OpenAI account; a 500k margin covers small outside use.
+const FREE_TOKENS_PER_DAY = 2_000_000;
 const PAID_CAP_NANO_USD = 900_000_000; // $0.90 per month, in billionths of a dollar
 const NANO_USD_PER_TOKEN = { in: 50, out: 400 }; // gpt-5-nano: $0.05 / $0.40 per 1M tokens
 const LIMITS = { ask: [10, 20], why: [20, 40] }; // per IP: [per hour, per day]
+// Counted up front so questions running at the same time can't all slip under the caps: [tokens, nano-USD].
+const RESERVE = { ask: [13_000, 1_000_000], why: [400, 40_000] };
 const TTL = 90 * 86400;
-export const SUMMARIZE_AT = 250;
 
 type Usage = { in: number; out: number };
 type Tier = 'free' | 'paid';
@@ -33,7 +35,7 @@ const lua = (src: string, keys: string[], args: (string | number)[]) => redis(['
 
 // One call per request: cache check, per-IP limits, free-pool / paid-budget check.
 // KEYS: cache, rl-hour, rl-day, tokens-today, usd-month, extra (trend key for ask, result key for why)
-// ARGV: hourLimit, dayLimit, freeLimit, paidCap, mode, member
+// ARGV: hourLimit, dayLimit, freeLimit, paidCap, mode, member, reserveTokens, reserveNanoUsd
 const GATE = `
 local hit = redis.call('GET', KEYS[1])
 if hit then
@@ -49,11 +51,13 @@ if tonumber(redis.call('GET', KEYS[4]) or '0') >= tonumber(ARGV[3]) then
 end
 redis.call('INCR', KEYS[2]); redis.call('EXPIRE', KEYS[2], 7200)
 redis.call('INCR', KEYS[3]); redis.call('EXPIRE', KEYS[3], 172800)
+if tier == 'free' then redis.call('INCRBY', KEYS[4], ARGV[7]); redis.call('EXPIRE', KEYS[4], 172800)
+else redis.call('INCRBY', KEYS[5], ARGV[8]); redis.call('EXPIRE', KEYS[5], 3456000) end
 if ARGV[5] == 'why' then return {'go', tier, redis.call('GET', KEYS[6])} end
 return {'go', tier}`;
 
-// After the OpenAI calls: save the result (if any), count tokens or dollars, bump trending.
-// KEYS: cache, tokens-today, usd-month, trend   ARGV: value, ttl, tier, tokens, nanoUsd, bump, member
+// After the OpenAI calls: save the result (if any), correct the up-front reservation to the real usage, bump trending.
+// KEYS: cache, tokens-today, usd-month, trend   ARGV: value, ttl, tier, tokensDelta, nanoUsdDelta, bump, member
 const COMMIT = `
 if ARGV[1] ~= '' then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]) end
 if ARGV[3] == 'free' then redis.call('INCRBY', KEYS[2], ARGV[4]); redis.call('EXPIRE', KEYS[2], 172800)
@@ -85,13 +89,15 @@ function gate(mode: 'ask' | 'why', ip: string, key: string, extra: string, membe
   return lua(
     GATE,
     [key, `rl:${mode}:${who}:${hour()}`, `rl:${mode}:${who}:${day()}`, `tok:${day()}`, `usd:${month()}`, extra],
-    [h, d, FREE_TOKENS_PER_DAY, PAID_CAP_NANO_USD, mode, member],
+    [h, d, FREE_TOKENS_PER_DAY, PAID_CAP_NANO_USD, mode, member, ...RESERVE[mode]],
   ) as Promise<[string, string?, string?]>;
 }
 
-function commit(key: string, value: string, tier: Tier, u: Usage, trend?: string, member = '') {
+// Must run after every gate 'go', even when nothing is saved, so the reservation is corrected.
+function commit(mode: 'ask' | 'why', key: string, value: string, tier: Tier, u: Usage, trend?: string, member = '') {
   const nano = u.in * NANO_USD_PER_TOKEN.in + u.out * NANO_USD_PER_TOKEN.out;
-  return lua(COMMIT, [key, `tok:${day()}`, `usd:${month()}`, trend ?? key], [value, TTL, tier, u.in + u.out, nano, trend ? 1 : 0, member]);
+  const [rt, rn] = RESERVE[mode];
+  return lua(COMMIT, [key, `tok:${day()}`, `usd:${month()}`, trend ?? key], [value, TTL, tier, u.in + u.out - rt, nano - rn, trend ? 1 : 0, member]);
 }
 
 // ---------- OpenAI (plain fetch) ----------
@@ -173,17 +179,6 @@ async function vote(tier: Tier, j: Judge, shown: string, options: string[], u: U
 export const resultId = (locale: Locale, question: string, options: string[]) =>
   createHash('sha256').update([locale, norm(question), ...options.map(norm)].join('\n')).digest('base64url').slice(0, 10);
 
-export function parseAsk(body: unknown): { locale: Locale; question: string; options: string[] } | null {
-  const b = body as { locale?: unknown; question?: unknown; options?: unknown } | null;
-  const question = typeof b?.question === 'string' ? b.question.trim() : '';
-  const options = Array.isArray(b?.options) ? b.options.map((o) => (typeof o === 'string' ? o.trim() : '')) : [];
-  const keys = options.map(norm);
-  if (question.length < 3 || question.length > 999) return null;
-  if (options.length < 2 || options.length > 6) return null;
-  if (options.some((o, i) => !o || o.length > 40 || !keys[i] || keys.indexOf(keys[i]) !== i)) return null;
-  return { locale: b?.locale === 'pt' ? 'pt' : 'en', question, options };
-}
-
 export const ipOf = (req: Request) =>
   req.headers.get('x-real-ip') ?? req.headers.get('x-forwarded-for')?.split(',')[0].trim() ?? 'local';
 
@@ -201,25 +196,28 @@ export async function ask(ip: string, locale: Locale, question: string, options:
   const tier = a as Tier;
   const u: Usage = { in: 0, out: 0 };
   try {
-    if (await flagged(`${question}\n${options.join('\n')}`)) return { status: 'blocked' };
+    if (await flagged(`${question}\n${options.join('\n')}`)) {
+      await commit('ask', key, '', tier, u);
+      return { status: 'blocked' };
+    }
     const long = question.length > SUMMARIZE_AT;
     const screen = JSON.parse(await chat(tier, SCREEN, JSON.stringify({ question, options, long }), u, SCREEN_FORMAT));
     if (!screen.allowed) {
-      await commit(key, '', tier, u);
+      await commit('ask', key, '', tier, u);
       return { status: 'blocked' };
     }
     const shown = long && screen.summary ? screen.summary : question;
     const votes = await Promise.all(JUDGES.map((j) => vote(tier, j, shown, options, u)));
     if (votes.filter((v) => v < 0).length > 10) {
-      await commit(key, '', tier, u);
+      await commit('ask', key, '', tier, u);
       return { status: 'error' };
     }
     const result: Result = { id, locale, question, shown, options, votes: votes.map((v) => (v < 0 ? '-' : v)).join(''), at: Date.now() };
-    await commit(key, JSON.stringify(result), tier, u, trend, id);
+    await commit('ask', key, JSON.stringify(result), tier, u, trend, id);
     return { status: 'ok', result };
   } catch (e) {
     console.error(e);
-    await commit(key, '', tier, u).catch(() => {}); // still count tokens already spent
+    await commit('ask', key, '', tier, u).catch(() => {}); // still count tokens already spent
     return { status: 'error' };
   }
 }
@@ -232,13 +230,14 @@ export async function why(ip: string, id: string, judgeId: number): Promise<Outc
   if (status === 'hit') return { status: 'ok', text: a! };
   if (status === 'limit') return { status: 'limit', window: a! };
   if (status === 'closed') return { status: 'closed' };
-  if (!raw) return { status: 'error' };
-
-  const r: Result = JSON.parse(raw);
-  const v = r.votes[judgeId - 1];
-  if (v === '-') return { status: 'error' };
   const tier = a as Tier;
   const u: Usage = { in: 0, out: 0 };
+  const r: Result | null = raw ? JSON.parse(raw) : null;
+  const v = r?.votes[judgeId - 1];
+  if (!r || !v || v === '-') {
+    await commit('why', key, '', tier, u); // release the reservation
+    return { status: 'error' };
+  }
   try {
     const text = (
       await chat(
@@ -249,11 +248,11 @@ export async function why(ip: string, id: string, judgeId: number): Promise<Outc
         u,
       )
     ).trim();
-    await commit(key, text, tier, u);
+    await commit('why', key, text, tier, u);
     return { status: 'ok', text };
   } catch (e) {
     console.error(e);
-    await commit(key, '', tier, u).catch(() => {});
+    await commit('why', key, '', tier, u).catch(() => {});
     return { status: 'error' };
   }
 }

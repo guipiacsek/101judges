@@ -1,4 +1,5 @@
-import { ask, ipOf, parseAsk } from '@/lib/server';
+import { ask, ipOf } from '@/lib/server';
+import { parseAsk } from '@/lib/vote';
 
 export const maxDuration = 60;
 

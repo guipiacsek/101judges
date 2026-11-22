@@ -11,3 +11,5 @@ export type Result = {
 };
 
 export type Trend = { id?: string; question: string; options: string[]; votes?: string };
+
+export const SUMMARIZE_AT = 250; // longer questions are summarized before the judges see them

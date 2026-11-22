@@ -4,6 +4,10 @@ import Home from '@/components/Home';
 import { getResult, getTrending } from '@/lib/server';
 
 export const revalidate = 3600; // results never change; trending below may lag by up to an hour
+// Empty list = build no pages up front, but cache each one on its first visit (without it the route renders every time).
+export async function generateStaticParams() {
+  return [];
+}
 
 type Props = { params: Promise<{ id: string }> };
 

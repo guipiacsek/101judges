@@ -1,7 +1,21 @@
-// Pure helpers (no imports) so they can be unit-tested with plain `node --test`.
+// Pure helpers (type-only imports) so they can be unit-tested with plain `node --test`.
+import type { Locale } from './types';
 
+// Keeps + and # so "C", "C++" and "C#" stay different options.
 export const norm = (s: string) =>
-  s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+  s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\p{L}\p{N}+#]+/gu, ' ').trim();
+
+// Trust boundary for /api/ask: anything that gets past this costs OpenAI tokens.
+export function parseAsk(body: unknown): { locale: Locale; question: string; options: string[] } | null {
+  const b = body as { locale?: unknown; question?: unknown; options?: unknown } | null;
+  const question = typeof b?.question === 'string' ? b.question.trim() : '';
+  const options = Array.isArray(b?.options) ? b.options.map((o) => (typeof o === 'string' ? o.trim() : '')) : [];
+  const keys = options.map(norm);
+  if (question.length < 3 || question.length > 999) return null;
+  if (options.length < 2 || options.length > 6) return null;
+  if (options.some((o, i) => !o || o.length > 40 || !keys[i] || keys.indexOf(keys[i]) !== i)) return null;
+  return { locale: b?.locale === 'pt' ? 'pt' : 'en', question, options };
+}
 
 // Map a model's plain-text reply to an option index, or -1 if it doesn't clearly name exactly one option.
 export function matchOption(reply: string, options: string[]): number {
