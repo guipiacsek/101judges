@@ -4,7 +4,7 @@ export type Judge = (typeof data)[number];
 export const JUDGES: Judge[] = data;
 
 export const COLORS = ['#0A84FF', '#FF9F0A', '#30D158', '#FF375F', '#BF5AF2', '#5AC8FA'];
-export const NONE = '#D3CEC6';
+export const NONE = '#C7C7CC';
 export const color = (v: string) => (v === '-' ? NONE : COLORS[+v]);
 
 // Seat order for the half circle: grouped by vote (no-answer last), then by age, so each answer forms a wedge.

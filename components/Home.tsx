@@ -73,6 +73,11 @@ export default function Home({ locale, trending, initial }: { locale: Locale; tr
               Judges
             </h1>
             <p className="lede">{t.lede}</p>
+            {!result && !busy && (
+              <div className="idle">
+                <Hemicycle votes={'-'.repeat(101)} options={[]} t={t} />
+              </div>
+            )}
           </div>
           <div className="ask">
             <div className="box">
