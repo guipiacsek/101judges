@@ -12,8 +12,7 @@ const FREE_TOKENS_PER_DAY = 2_000_000;
 const PAID_CAP_NANO_USD = 900_000_000; // $0.90 per month, in billionths of a dollar
 const NANO_USD_PER_TOKEN = { in: 50, out: 400 }; // gpt-5-nano: $0.05 / $0.40 per 1M tokens
 const LIMITS = { ask: [10, 20], why: [20, 40] }; // per IP: [per hour, per day]
-// Counted up front so questions running at the same time can't all slip under the caps: [tokens, nano-USD].
-const RESERVE = { ask: [13_000, 1_000_000], why: [400, 40_000] };
+const MAX_OUT = { vote: 64, screen: 500, why: 120 }; // max_completion_tokens per call
 const TTL = 90 * 86400;
 
 type Usage = { in: number; out: number };
@@ -26,6 +25,7 @@ async function redis(cmd: (string | number)[]) {
     method: 'POST',
     headers: { Authorization: `Bearer ${process.env.KV_REST_API_TOKEN}` },
     body: JSON.stringify(cmd),
+    signal: AbortSignal.timeout(5_000),
   });
   const d = await res.json();
   if (d.error) throw new Error('redis: ' + d.error);
@@ -34,12 +34,15 @@ async function redis(cmd: (string | number)[]) {
 const lua = (src: string, keys: string[], args: (string | number)[]) => redis(['EVAL', src, keys.length, ...keys, ...args]);
 
 // One call per request: cache check, per-IP limits, free-pool / paid-budget check.
-// KEYS: cache, rl-hour, rl-day, tokens-today, usd-month, extra (trend key for ask, result key for why)
+// KEYS: cache, rl-hour, rl-day, tokens-today, usd-month, extra (trend key for ask, result key for why), trend-dedupe
 // ARGV: hourLimit, dayLimit, freeLimit, paidCap, mode, member, reserveTokens, reserveNanoUsd
 const GATE = `
 local hit = redis.call('GET', KEYS[1])
 if hit then
-  if ARGV[5] == 'ask' then redis.call('ZINCRBY', KEYS[6], 1, ARGV[6]); redis.call('EXPIRE', KEYS[6], 172800) end
+  -- re-asking a cached question bumps trending at most once per visitor per day
+  if ARGV[5] == 'ask' and redis.call('SET', KEYS[7], 1, 'NX', 'EX', 172800) then
+    redis.call('ZINCRBY', KEYS[6], 1, ARGV[6]); redis.call('EXPIRE', KEYS[6], 172800)
+  end
   return {'hit', hit}
 end
 if tonumber(redis.call('GET', KEYS[2]) or '0') >= tonumber(ARGV[1]) then return {'limit', 'hour'} end
@@ -57,12 +60,15 @@ if ARGV[5] == 'why' then return {'go', tier, redis.call('GET', KEYS[6])} end
 return {'go', tier}`;
 
 // After the OpenAI calls: save the result (if any), correct the up-front reservation to the real usage, bump trending.
-// KEYS: cache, tokens-today, usd-month, trend   ARGV: value, ttl, tier, tokensDelta, nanoUsdDelta, bump, member
+// KEYS: cache, tokens-today, usd-month, trend, trend-dedupe   ARGV: value, ttl, tier, tokensDelta, nanoUsdDelta, bump, member
 const COMMIT = `
 if ARGV[1] ~= '' then redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]) end
 if ARGV[3] == 'free' then redis.call('INCRBY', KEYS[2], ARGV[4]); redis.call('EXPIRE', KEYS[2], 172800)
 else redis.call('INCRBY', KEYS[3], ARGV[5]); redis.call('EXPIRE', KEYS[3], 3456000) end
-if ARGV[6] == '1' then redis.call('ZINCRBY', KEYS[4], 1, ARGV[7]); redis.call('EXPIRE', KEYS[4], 172800) end
+if ARGV[6] == '1' then
+  redis.call('ZINCRBY', KEYS[4], 1, ARGV[7]); redis.call('EXPIRE', KEYS[4], 172800)
+  redis.call('SET', KEYS[5], 1, 'EX', 172800)
+end
 return 1`;
 
 // Top 5 results from today's trending set, topped up from yesterday's.
@@ -83,21 +89,43 @@ const day = (d = new Date()) => iso(d).slice(0, 10); // UTC, same reset as OpenA
 const hour = () => iso().slice(0, 13);
 const month = () => iso().slice(0, 7);
 
-function gate(mode: 'ask' | 'why', ip: string, key: string, extra: string, member = '') {
+// Upper bound on one request's cost, reserved up front so requests running at the same time can't overshoot the caps.
+// UTF-8 byte length bounds the token count for OpenAI's byte-level tokenizers.
+const bytes = (s: string) => Buffer.byteLength(s);
+const VOTE_RULE = '\nAnswer as this person honestly would, given their background and values. Reply with exactly one of the options, copied exactly, and nothing else.';
+const PERSONA_MAX = Math.max(...JUDGES.map((j) => bytes(persona(j))));
+const PER_CALL = 50; // chat message framing
+type Reserve = { in: number; out: number };
+const nanoUsd = (u: Usage) => u.in * NANO_USD_PER_TOKEN.in + u.out * NANO_USD_PER_TOKEN.out;
+
+function askReserve(question: string, options: string[], long: boolean): Reserve {
+  const shown = long ? MAX_OUT.screen : bytes(question); // long questions reach the judges as the summary
+  const vote = PERSONA_MAX + bytes(VOTE_RULE) + shown + bytes(options.join('\n- ')) + 20 + PER_CALL;
+  const screen = bytes(SCREEN) + bytes(JSON.stringify({ question, options, long })) + 300 + PER_CALL;
+  return { in: screen + 2 * JUDGES.length * vote, out: MAX_OUT.screen + 2 * JUDGES.length * MAX_OUT.vote }; // 2 attempts per judge
+}
+// why: shown is at most 250 UTF-16 units (≤750 bytes) or the summary; options at most 6×40 units (≤720 bytes).
+const WHY_RESERVE: Reserve = { in: PERSONA_MAX + 40 + Math.max(750, MAX_OUT.screen) + 720 + 300 + PER_CALL, out: MAX_OUT.why };
+
+type Ctx = { key: string; who: string; tok: string; usd: string; reserve: Reserve };
+function ctx(ip: string, key: string, reserve: Reserve): Ctx {
   const who = createHash('sha256').update(ip).digest('hex').slice(0, 16); // never store raw IPs
+  return { key, who, tok: `tok:${day()}`, usd: `usd:${month()}`, reserve }; // commit corrects the same day/month it reserved
+}
+
+function gate(mode: 'ask' | 'why', c: Ctx, extra: string, member = '') {
   const [h, d] = LIMITS[mode];
   return lua(
     GATE,
-    [key, `rl:${mode}:${who}:${hour()}`, `rl:${mode}:${who}:${day()}`, `tok:${day()}`, `usd:${month()}`, extra],
-    [h, d, FREE_TOKENS_PER_DAY, PAID_CAP_NANO_USD, mode, member, ...RESERVE[mode]],
+    [c.key, `rl:${mode}:${c.who}:${hour()}`, `rl:${mode}:${c.who}:${day()}`, c.tok, c.usd, extra, `tb:${member}:${c.who}`],
+    [h, d, FREE_TOKENS_PER_DAY, PAID_CAP_NANO_USD, mode, member, c.reserve.in + c.reserve.out, nanoUsd(c.reserve)],
   ) as Promise<[string, string?, string?]>;
 }
 
 // Must run after every gate 'go', even when nothing is saved, so the reservation is corrected.
-function commit(mode: 'ask' | 'why', key: string, value: string, tier: Tier, u: Usage, trend?: string, member = '') {
-  const nano = u.in * NANO_USD_PER_TOKEN.in + u.out * NANO_USD_PER_TOKEN.out;
-  const [rt, rn] = RESERVE[mode];
-  return lua(COMMIT, [key, `tok:${day()}`, `usd:${month()}`, trend ?? key], [value, TTL, tier, u.in + u.out - rt, nano - rn, trend ? 1 : 0, member]);
+function commit(c: Ctx, value: string, tier: Tier, u: Usage, trend?: string, member = '') {
+  const r = c.reserve;
+  return lua(COMMIT, [c.key, c.tok, c.usd, trend ?? c.key, `tb:${member}:${c.who}`], [value, TTL, tier, u.in + u.out - r.in - r.out, nanoUsd(u) - nanoUsd(r), trend ? 1 : 0, member]);
 }
 
 // ---------- OpenAI (plain fetch) ----------
@@ -107,16 +135,18 @@ async function openai(path: string, body: object) {
     method: 'POST',
     headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12_000), // keeps moderation + screen + 2 vote attempts under maxDuration, so commit always runs
   });
   const d = await res.json();
   if (!res.ok) throw new Error(`openai ${res.status}: ${d.error?.message}`);
   return d;
 }
 
-async function chat(tier: Tier, system: string, user: string, u: Usage, extra: object = {}) {
+async function chat(tier: Tier, maxOut: number, system: string, user: string, u: Usage, extra: object = {}) {
   const d = await openai('chat/completions', {
     model: tier === 'free' ? FREE_MODEL : PAID_MODEL,
     reasoning_effort: 'minimal',
+    max_completion_tokens: maxOut,
     messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
     ...extra,
   });
@@ -161,7 +191,8 @@ async function vote(tier: Tier, j: Judge, shown: string, options: string[], u: U
     try {
       const reply = await chat(
         tier,
-        `${persona(j)}\nAnswer as this person honestly would, given their background and values. Reply with exactly one of the options, copied exactly, and nothing else.`,
+        MAX_OUT.vote,
+        persona(j) + VOTE_RULE,
         `${shown}\n\nOptions:\n${shuffle(options).map((o) => '- ' + o).join('\n')}`, // shuffled per judge: avoids position bias
         u,
       );
@@ -179,16 +210,18 @@ async function vote(tier: Tier, j: Judge, shown: string, options: string[], u: U
 export const resultId = (locale: Locale, question: string, options: string[]) =>
   createHash('sha256').update([locale, norm(question), ...options.map(norm)].join('\n')).digest('base64url').slice(0, 10);
 
-export const ipOf = (req: Request) =>
-  req.headers.get('x-real-ip') ?? req.headers.get('x-forwarded-for')?.split(',')[0].trim() ?? 'local';
+// Vercel sets x-real-ip to the connecting client and overwrites any value the client sends.
+// x-forwarded-for is not used: its first entry can be prepended by the client behind other proxies.
+export const ipOf = (req: Request) => req.headers.get('x-real-ip') ?? 'local';
 
 export type Outcome<T> = ({ status: 'ok' } & T) | { status: 'blocked' | 'closed' | 'error' } | { status: 'limit'; window: string };
 
 export async function ask(ip: string, locale: Locale, question: string, options: string[]): Promise<Outcome<{ result: Result }>> {
   const id = resultId(locale, question, options);
-  const key = `r:${id}`;
   const trend = `trend:${locale}:${day()}`;
-  const [status, a] = await gate('ask', ip, key, trend, id);
+  const long = question.length > SUMMARIZE_AT;
+  const c = ctx(ip, `r:${id}`, askReserve(question, options, long));
+  const [status, a] = await gate('ask', c, trend, id);
   if (status === 'hit') return { status: 'ok', result: JSON.parse(a!) };
   if (status === 'limit') return { status: 'limit', window: a! };
   if (status === 'closed') return { status: 'closed' };
@@ -197,27 +230,27 @@ export async function ask(ip: string, locale: Locale, question: string, options:
   const u: Usage = { in: 0, out: 0 };
   try {
     if (await flagged(`${question}\n${options.join('\n')}`)) {
-      await commit('ask', key, '', tier, u);
+      await commit(c, '', tier, u);
       return { status: 'blocked' };
     }
-    const long = question.length > SUMMARIZE_AT;
-    const screen = JSON.parse(await chat(tier, SCREEN, JSON.stringify({ question, options, long }), u, SCREEN_FORMAT));
-    if (!screen.allowed) {
-      await commit('ask', key, '', tier, u);
-      return { status: 'blocked' };
-    }
+    const screen = JSON.parse(await chat(tier, MAX_OUT.screen, SCREEN, JSON.stringify({ question, options, long }), u, SCREEN_FORMAT));
     const shown = long && screen.summary ? screen.summary : question;
+    // The summary is model-written and shown to everyone, so it gets the same moderation as the question.
+    if (!screen.allowed || (shown !== question && (await flagged(shown)))) {
+      await commit(c, '', tier, u);
+      return { status: 'blocked' };
+    }
     const votes = await Promise.all(JUDGES.map((j) => vote(tier, j, shown, options, u)));
     if (votes.filter((v) => v < 0).length > 10) {
-      await commit('ask', key, '', tier, u);
+      await commit(c, '', tier, u);
       return { status: 'error' };
     }
     const result: Result = { id, locale, question, shown, options, votes: votes.map((v) => (v < 0 ? '-' : v)).join(''), at: Date.now() };
-    await commit('ask', key, JSON.stringify(result), tier, u, trend, id);
+    await commit(c, JSON.stringify(result), tier, u, trend, id);
     return { status: 'ok', result };
   } catch (e) {
     console.error(e);
-    await commit('ask', key, '', tier, u).catch(() => {}); // still count tokens already spent
+    await commit(c, '', tier, u).catch(() => {}); // still count tokens already spent
     return { status: 'error' };
   }
 }
@@ -225,8 +258,8 @@ export async function ask(ip: string, locale: Locale, question: string, options:
 export async function why(ip: string, id: string, judgeId: number): Promise<Outcome<{ text: string }>> {
   const j = JUDGES.find((x) => x.id === judgeId);
   if (!j || !/^[\w-]{10}$/.test(id)) return { status: 'error' };
-  const key = `w:${id}:${judgeId}`;
-  const [status, a, raw] = await gate('why', ip, key, `r:${id}`);
+  const c = ctx(ip, `w:${id}:${judgeId}`, WHY_RESERVE);
+  const [status, a, raw] = await gate('why', c, `r:${id}`);
   if (status === 'hit') return { status: 'ok', text: a! };
   if (status === 'limit') return { status: 'limit', window: a! };
   if (status === 'closed') return { status: 'closed' };
@@ -235,24 +268,30 @@ export async function why(ip: string, id: string, judgeId: number): Promise<Outc
   const r: Result | null = raw ? JSON.parse(raw) : null;
   const v = r?.votes[judgeId - 1];
   if (!r || !v || v === '-') {
-    await commit('why', key, '', tier, u); // release the reservation
+    await commit(c, '', tier, u); // release the reservation
     return { status: 'error' };
   }
   try {
     const text = (
       await chat(
         tier,
+        MAX_OUT.why,
         `${persona(j)}\nStay in character as this person.`,
         `You were asked: "${r.shown}"\nOptions: ${r.options.join(' | ')}\nYou voted: ${r.options[+v]}\n\n` +
           `In one short, casual sentence (max 25 words), in first person, say why you voted that way. Write in ${r.locale === 'pt' ? 'Brazilian Portuguese' : 'English'}.`,
         u,
       )
     ).trim();
-    await commit('why', key, text, tier, u);
+    // Cached and shown to every later visitor, so it is moderated like the question.
+    if (!text || (await flagged(text))) {
+      await commit(c, '', tier, u);
+      return { status: 'error' };
+    }
+    await commit(c, text, tier, u);
     return { status: 'ok', text };
   } catch (e) {
     console.error(e);
-    await commit('why', key, '', tier, u).catch(() => {});
+    await commit(c, '', tier, u).catch(() => {});
     return { status: 'error' };
   }
 }

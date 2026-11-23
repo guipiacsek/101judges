@@ -11,7 +11,7 @@ Ask anything, give 2–6 options, and 101 AI judges, each a different American p
 - **Long questions** (over 250 characters) are summarized before the judges see them; the result shows what they saw.
 - **Safety:** OpenAI's moderation endpoint plus a screening prompt block sex, drugs, real-world violence, self-harm and hate. Fiction and sports are fine.
 - **Budget:** for the first 2M tokens a day (OpenAI gives 2.5M free, shared across the whole OpenAI account) it uses `gpt-5-mini`; after that `gpt-5-nano`, capped at $0.90 a month, then it pauses.
-- **Redis (Upstash):** one Lua script per request handles caching, per-IP limits (10 questions/hour, 20/day; 20 "why"/hour, 40/day), token and budget counters (reserved up front so parallel requests cannot overshoot), and trending. A Vercel Firewall rule also limits each IP to 60 requests a minute on `/api/*` and `/r/*`.
+- **Redis (Upstash):** one Lua script per request handles caching, per-IP limits (10 questions/hour, 20/day; 20 "why"/hour, 40/day), token and budget counters (an upper bound on each request is reserved up front, so parallel requests cannot overshoot; every model call has an output cap), and trending (one bump per visitor per question per day). A Vercel Firewall rule also limits each IP to 60 requests a minute on `/api/*` and `/r/*`.
 
 ## Run locally
 
