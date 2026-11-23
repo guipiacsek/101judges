@@ -4,7 +4,7 @@ import { seats } from './vote';
 import type { Result } from './types';
 
 export const size = { width: 1200, height: 630 };
-const BG = '#FCFBF9';
+const BG = '#FFFFFF';
 const INK = '#111110';
 const MUTED = '#6F6B64';
 
