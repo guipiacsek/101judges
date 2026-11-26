@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { matchOption, parseAsk, seats, shuffle } from './vote.ts';
+import { parseAsk, pickByOdds, seats, shuffle } from './vote.ts';
 
 test('parseAsk guards what reaches OpenAI', () => {
   const ok = { question: 'Best language?', options: ['C', 'C++', 'C#'] };
@@ -15,19 +15,15 @@ test('parseAsk guards what reaches OpenAI', () => {
   assert.equal(parseAsk(null), null);
 });
 
-test('matchOption maps replies to options', () => {
-  const yn = ['Yes', 'No'];
-  assert.equal(matchOption('Yes', yn), 0);
-  assert.equal(matchOption(' no. ', yn), 1);
-  assert.equal(matchOption('I would say no', yn), 1);
-  assert.equal(matchOption('Yes and no', yn), -1);
-  assert.equal(matchOption('maybe', yn), -1);
-  assert.equal(matchOption('Não', ['Sim', 'Não']), 1);
-  assert.equal(matchOption('nao', ['Sim', 'Não']), 1);
-  assert.equal(matchOption('Messi and Ronaldo', ['Messi', 'Messi and Ronaldo']), 1);
-  assert.equal(matchOption('2000s', ['90s', '2000s']), 1);
-  assert.equal(matchOption('C++', ['C', 'C++', 'C#']), 1);
-  assert.equal(matchOption('C', ['C', 'C++', 'C#']), 0);
+test('pickByOdds rolls the judge\'s odds', () => {
+  assert.equal(pickByOdds('70 30', 2, 0), 0);
+  assert.equal(pickByOdds('70 30', 2, 0.69), 0);
+  assert.equal(pickByOdds('70 30', 2, 0.7), 1);
+  assert.equal(pickByOdds('A: 0, B: 100', 2, 0.01), 1); // labels and punctuation are ignored
+  assert.equal(pickByOdds('5 10 60 25', 4, 0.99), 3);
+  assert.equal(pickByOdds('50 50', 3), -1); // wrong count
+  assert.equal(pickByOdds('0 0', 2), -1); // no positive total
+  assert.equal(pickByOdds('Yes', 2), -1);
 });
 
 test('101 seats, left to right', () => {

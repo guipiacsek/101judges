@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { cache } from 'react';
 import { JUDGES, persona, type Judge } from './judges';
-import { matchOption, norm, shuffle } from './vote';
+import { norm, pickByOdds, shuffle } from './vote';
 import { SUMMARIZE_AT, type Locale, type Result, type Trend } from './types';
 import { T } from './i18n';
 
@@ -92,7 +92,7 @@ const month = () => iso().slice(0, 7);
 // Upper bound on one request's cost, reserved up front so requests running at the same time can't overshoot the caps.
 // UTF-8 byte length bounds the token count for OpenAI's byte-level tokenizers.
 const bytes = (s: string) => Buffer.byteLength(s);
-const VOTE_RULE = '\nAnswer as this person honestly would, given their background and values. Reply with exactly one of the options, copied exactly, and nothing else.';
+const VOTE_RULE = '\nGive the chance (0-100) that this person would pick each option. Reply with only the numbers for A, B, C... in order, separated by spaces, summing to 100.';
 const PERSONA_MAX = Math.max(...JUDGES.map((j) => bytes(persona(j))));
 const PER_CALL = 50; // chat message framing
 type Reserve = { in: number; out: number };
@@ -189,15 +189,17 @@ const SCREEN_FORMAT = {
 async function vote(tier: Tier, j: Judge, shown: string, options: string[], u: Usage) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
+      const order = shuffle(options.map((_, i) => i)); // shuffled per judge: avoids position bias
       const reply = await chat(
         tier,
         MAX_OUT.vote,
         persona(j) + VOTE_RULE,
-        `${shown}\n\nOptions:\n${shuffle(options).map((o) => '- ' + o).join('\n')}`, // shuffled per judge: avoids position bias
+        `${shown}\n\nOptions:\n${order.map((o, k) => `${'ABCDEF'[k]}. ${options[o]}`).join('\n')}`,
         u,
       );
-      const i = matchOption(reply, options);
-      if (i >= 0) return i;
+      // The judge gives odds and the server rolls them, so a group leans the same way without voting as one block.
+      const k = pickByOdds(reply, options.length);
+      if (k >= 0) return order[k];
     } catch (e) {
       console.error(e);
     }

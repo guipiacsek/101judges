@@ -7,7 +7,7 @@ Ask anything, give 2–6 options, and 101 AI judges, each a different American p
 ## How it works
 
 - **Judges:** [`judges.json`](judges.json) has 101 personas built from US demographic stats (age, gender, politics, income, religion, education, profession, personality, a quirk).
-- **Voting:** one OpenAI call per judge (`gpt-5-mini`, minimal reasoning, plain-text answer). Option order is shuffled per judge to avoid position bias.
+- **Voting:** one OpenAI call per judge (`gpt-5-mini`, minimal reasoning). Each judge replies with odds for every option (e.g. "70 30") and the server rolls them, so groups lean realistically instead of voting as one block. Options are labeled A–F in a shuffled order per judge to avoid position bias.
 - **Long questions** (over 250 characters) are summarized before the judges see them; the result shows what they saw.
 - **Safety:** OpenAI's moderation endpoint plus a screening prompt block sex, drugs, real-world violence, self-harm and hate. Fiction and sports are fine.
 - **Budget:** for the first 2M tokens a day (OpenAI gives 2.5M free, shared across the whole OpenAI account) it uses `gpt-5-mini`; after that `gpt-5-nano`, capped at $0.90 a month, then it pauses.

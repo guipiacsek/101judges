@@ -17,14 +17,15 @@ export function parseAsk(body: unknown): { locale: Locale; question: string; opt
   return { locale: b?.locale === 'pt' ? 'pt' : 'en', question, options };
 }
 
-// Map a model's plain-text reply to an option index, or -1 if it doesn't clearly name exactly one option.
-export function matchOption(reply: string, options: string[]): number {
-  const r = norm(reply);
-  const opts = options.map(norm);
-  const exact = opts.indexOf(r);
-  if (exact >= 0) return exact;
-  const hits = opts.flatMap((o, i) => (` ${r} `.includes(` ${o} `) ? [i] : []));
-  return hits.length === 1 ? hits[0] : -1;
+// Read a judge's odds reply ("70 20 10", one number per listed option) and roll the dice.
+// Returns the picked position in the listed order, or -1 if the reply isn't exactly n numbers with a positive total.
+export function pickByOdds(reply: string, n: number, roll = Math.random()): number {
+  const odds = reply.match(/\d+(\.\d+)?/g)?.map(Number) ?? [];
+  const total = odds.reduce((a, b) => a + b, 0);
+  if (odds.length !== n || total <= 0) return -1;
+  let x = roll * total;
+  for (let k = 0; k < n; k++) if ((x -= odds[k]) < 0) return k;
+  return n - 1;
 }
 
 export function shuffle<T>(a: T[]): T[] {
